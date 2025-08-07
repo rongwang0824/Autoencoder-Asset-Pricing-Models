@@ -205,7 +205,7 @@ def calculate_comprehensive_r2(full_results_df, port_wts, port_list):
     r2_total_idiv = calculate_r2(full_results_df['ret'], full_results_df['fitted_ret'])
     r2_pred_idiv = calculate_r2(full_results_df['ret'], full_results_df['pred_ret'])
 
-    # --- Universe 2: Externally Defined Portfolios ---
+    # --- Universe 2: Externally Defined Portfolios (Looping for memory efficiency) ---
     port_ret_df = pd.merge(full_results_df, port_wts, on=['date', 'permno'])
     all_monthly_port_returns = []
     for p_col in port_list:
@@ -235,7 +235,7 @@ def calculate_r2(true_ret, fitted_ret):
     return 1 - sse / sst if sst != 0 else 0
 
 # --- Main Function: INS and OOS Estimation ---
-def run_model(data, param_grid, config, oos_start, oos_end, val_window, num_factors, beta_hidden_layers, analysis_type):
+def run_model(data, param_grid, config, oos_start, oos_end, val_window, num_factors, beta_hidden_layers):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"*Using device: {device}")
@@ -248,17 +248,99 @@ def run_model(data, param_grid, config, oos_start, oos_end, val_window, num_fact
         os.makedirs(os.path.dirname(config.output_path), exist_ok=True)
 
     # --- In-Sample Estimation ---
-    if analysis_type in ['INS', 'ALL']:
-        ins_start_time = time.time()
-        print("\n" + "="*30 + "\nIn-Sample Estimation\n" + "="*30)
-        
-        ins_val_end_date = df['date'].max()
-        ins_train_end_date = ins_val_end_date - DateOffset(years=val_window)
-        ins_train_df = df[df['date'] <= ins_train_end_date]
-        ins_val_df = df[df['date'] > ins_train_end_date]
+    ins_start_time = time.time()
+    print("\n" + "="*30 + "\nIn-Sample Estimation\n" + "="*30)
+    
+    ins_val_end_date = df['date'].max()
+    ins_train_end_date = ins_val_end_date - DateOffset(years=val_window)
+    ins_train_df = df[df['date'] <= ins_train_end_date]
+    ins_val_df = df[df['date'] > ins_train_end_date]
 
-        ins_train_loader = DataLoader(PanelDataset(ins_train_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=True)
-        ins_val_loader = DataLoader(PanelDataset(ins_val_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=False)
+    ins_train_loader = DataLoader(PanelDataset(ins_train_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=True)
+    ins_val_loader = DataLoader(PanelDataset(ins_val_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=False)
+    
+    print("- Tuning Hyperparameters")
+    tuning_results = []
+    keys, values = zip(*param_grid.items())
+    param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    for i, grid_params in enumerate(param_combinations):
+        current_params = {**grid_params, 'num_factors': num_factors, 'beta_hidden_layers': beta_hidden_layers}
+        val_loss = train_single_model(current_params, config, ins_train_loader, ins_val_loader, num_charcs, num_ports, device)
+        tuning_results.append({'params': grid_params, 'loss': val_loss})
+    best_grid_params = min(tuning_results, key=lambda x: x['loss'])['params']
+    print(f"- Best Tuned Params for In-Sample Run: {best_grid_params}")
+    
+    final_ins_model = Autoencoder(num_charcs, num_ports, num_factors, beta_hidden_layers).to(device)
+    optimizer = optim.Adam(final_ins_model.parameters(), lr=best_grid_params['learning_rate'])
+    criterion = nn.MSELoss()
+    full_loader = DataLoader(PanelDataset(df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=True)
+    
+    for epoch in tqdm(range(config.max_epochs), desc="- Final In-Sample Estimation"):
+        final_ins_model.train()
+        for Z, R, port_ret, _, _ in full_loader:
+            Z, R, port_ret = Z.squeeze(0).to(device), R.squeeze(0).to(device), port_ret.squeeze(0).to(device)
+            if Z.shape[0] < num_charcs: continue
+            optimizer.zero_grad()
+            fitted_returns = final_ins_model(Z, port_ret)
+            mse_loss = criterion(fitted_returns, R)
+            l1_norm = sum(p.abs().sum() for p in final_ins_model.parameters())
+            loss = mse_loss + best_grid_params['l1_lambda'] * l1_norm
+            loss.backward()
+            optimizer.step()
+
+    params_df, factors_df, returns_df = extract_results(final_ins_model, full_loader, device, num_factors)
+    
+    with pd.HDFStore(config.output_path, 'a') as store:
+        port_params_df = calculate_portfolio_parameters(params_df, port_wts, num_factors)
+        store.put(f'INS/F{num_factors}/individual_params', params_df, format='table', data_columns=True)
+        store.put(f'INS/F{num_factors}/port_params', port_params_df, format='table', data_columns=True)
+        store.put(f'INS/F{num_factors}/factors', factors_df, format='table', data_columns=True)
+
+    print("- INS R2s")
+    returns_df = pd.merge(returns_df, params_df, on=['date', 'permno'])
+    returns_df = pd.merge(returns_df, factors_df, left_on='date', right_index=True)
+    
+    beta_cols = [f'beta_{i+1}' for i in range(num_factors)]
+    factor_cols = [f'factor_{i+1}' for i in range(num_factors)]
+    returns_df['risk_premium'] = (returns_df[beta_cols].values * returns_df[factor_cols].values).sum(axis=1)
+    returns_df['fitted_ret'] = returns_df['alpha'] + returns_df['risk_premium']
+    
+    # Use simple mean of all historical factors for lambda
+    lambda_values = factors_df.mean()
+    lambda_cols = [f'lambda_{i+1}' for i in range(num_factors)]
+    for i, col in enumerate(lambda_cols):
+        returns_df[col] = lambda_values[i]
+
+    returns_df['pred_risk_premium'] = (returns_df[beta_cols].values * returns_df[lambda_cols].values).sum(axis=1)
+    returns_df['pred_ret'] = returns_df['alpha'] + returns_df['pred_risk_premium']
+
+    ins_r2_df = calculate_comprehensive_r2(returns_df, port_wts, port_list)    
+    print(ins_r2_df)
+    with pd.HDFStore(config.output_path, 'a') as store:
+        store.put(f'INS/F{num_factors}/r2', ins_r2_df, format='table', data_columns=True)
+    
+    ins_elapsed = time.time() - ins_start_time
+    print(f"In-sample analysis finished. Time spent: {ins_elapsed / 60:.2f} minutes.")
+
+    # --- Out-of-Sample Estimation ---
+    oos_start_time = time.time()
+    print("\n" + "="*30 + "\nOut-of-Sample Estimation\n" + "="*30)
+
+    oos_results_accumulator = []
+    for year in range(oos_start, oos_end + 1):
+        print("\n" + "-"*15 + f"\nTest Year: {year}\n" + "-"*15)
+
+        test_start_date, test_end_date = pd.to_datetime(f'{year}-01-01'), pd.to_datetime(f'{year}-12-31')
+        val_end_date = test_start_date - MonthEnd(1)
+        train_end_date = val_end_date - DateOffset(years=val_window)
+
+        train_df = df[df['date'] <= train_end_date]
+        val_df = df[(df['date'] > train_end_date) & (df['date'] <= val_end_date)]
+        test_df = df[(df['date'] >= test_start_date) & (df['date'] <= test_end_date)]
+        
+        train_loader = DataLoader(PanelDataset(train_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=True)
+        val_loader = DataLoader(PanelDataset(val_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=False)
+        test_loader = DataLoader(PanelDataset(test_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=False)
         
         print("- Tuning Hyperparameters")
         tuning_results = []
@@ -266,171 +348,93 @@ def run_model(data, param_grid, config, oos_start, oos_end, val_window, num_fact
         param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
         for i, grid_params in enumerate(param_combinations):
             current_params = {**grid_params, 'num_factors': num_factors, 'beta_hidden_layers': beta_hidden_layers}
-            val_loss = train_single_model(current_params, config, ins_train_loader, ins_val_loader, num_charcs, num_ports, device)
+            val_loss = train_single_model(current_params, config, train_loader, val_loader, num_charcs, num_ports, device)
             tuning_results.append({'params': grid_params, 'loss': val_loss})
         best_grid_params = min(tuning_results, key=lambda x: x['loss'])['params']
-        print(f" - Best Tuned Params for In-Sample Run: {best_grid_params}")
-        
-        final_ins_model = Autoencoder(num_charcs, num_ports, num_factors, beta_hidden_layers).to(device)
-        optimizer = optim.Adam(final_ins_model.parameters(), lr=best_grid_params['learning_rate'])
+        print(f"- Best Tuned Params: {best_grid_params}")
+
+        final_model = Autoencoder(num_charcs, num_ports, num_factors, beta_hidden_layers).to(device)
+        optimizer = optim.Adam(final_model.parameters(), lr=best_grid_params['learning_rate'])
         criterion = nn.MSELoss()
-        full_loader = DataLoader(PanelDataset(df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=True)
         
-        for epoch in tqdm(range(config.max_epochs), desc=" - Final In-Sample Estimation"):
-            final_ins_model.train()
-            for Z, R, port_ret, _, _ in full_loader:
+        training_data_loader = DataLoader(PanelDataset(pd.concat([train_df, val_df]), charc_list, port, port_list), batch_size=config.batch_size, shuffle=True)
+        
+        for epoch in tqdm(range(config.max_epochs), desc=f"- Final Training"):
+            final_model.train()
+            for Z, R, port_ret, _, _ in training_data_loader:
                 Z, R, port_ret = Z.squeeze(0).to(device), R.squeeze(0).to(device), port_ret.squeeze(0).to(device)
                 if Z.shape[0] < num_charcs: continue
                 optimizer.zero_grad()
-                fitted_returns = final_ins_model(Z, port_ret)
+                fitted_returns = final_model(Z, port_ret)
                 mse_loss = criterion(fitted_returns, R)
-                l1_norm = sum(p.abs().sum() for p in final_ins_model.parameters())
+                l1_norm = sum(p.abs().sum() for p in final_model.parameters())
                 loss = mse_loss + best_grid_params['l1_lambda'] * l1_norm
                 loss.backward()
                 optimizer.step()
 
-        params_df, factors_df, returns_df = extract_results(final_ins_model, full_loader, device, num_factors)
+        print("- Extracting & Saving OOS Results")
+        # Extract for test set
+        test_params_df, test_factors_df, test_returns_df = extract_results(final_model, test_loader, device, num_factors)
         
-        with pd.HDFStore(config.output_path, 'a') as store:
-            port_params_df = calculate_portfolio_parameters(params_df, port_wts, num_factors)
-            store.put(f'INS/F{num_factors}/individual_params', params_df, format='table', data_columns=True)
-            store.put(f'INS/F{num_factors}/port_params', port_params_df, format='table', data_columns=True)
-            store.put(f'INS/F{num_factors}/factors', factors_df, format='table', data_columns=True)
+        # Extract for training set
+        train_params_df, train_factors_df, _ = extract_results(final_model, training_data_loader, device, num_factors)
 
-        returns_df = pd.merge(returns_df, params_df, on=['date', 'permno'])
-        returns_df = pd.merge(returns_df, factors_df, left_on='date', right_index=True)
-        
-        beta_cols = [f'beta_{i+1}' for i in range(num_factors)]
-        factor_cols = [f'factor_{i+1}' for i in range(num_factors)]
-        returns_df['risk_premium'] = (returns_df[beta_cols].values * returns_df[factor_cols].values).sum(axis=1)
-        returns_df['fitted_ret'] = returns_df['alpha'] + returns_df['risk_premium']
-        
-        # Use simple mean of all historical factors for lambda
-        lambda_values = factors_df.mean()
-        lambda_cols = [f'lambda_{i+1}' for i in range(num_factors)]
-        for i, col in enumerate(lambda_cols):
-            returns_df[col] = lambda_values[i]
+        if not test_params_df.empty:
+            # Filter training parameters to only the last 12 months (validation period)
+            last_12m_start_date = val_end_date - DateOffset(years=1) + MonthBegin(1)
+            train_params_df_last_12m = train_params_df[train_params_df['date'] >= last_12m_start_date]
 
-        returns_df['pred_risk_premium'] = (returns_df[beta_cols].values * returns_df[lambda_cols].values).sum(axis=1)
-        returns_df['pred_ret'] = returns_df['alpha'] + returns_df['pred_risk_premium']
-
-        print("- INS R2s")
-        ins_r2_df = calculate_comprehensive_r2(returns_df, port_wts, port_list)    
-        print(ins_r2_df)
-        with pd.HDFStore(config.output_path, 'a') as store:
-            store.put(f'INS/F{num_factors}/r2', ins_r2_df, format='table', data_columns=True)
-        
-        ins_elapsed = time.time() - ins_start_time
-        print(f"In-sample analysis finished. Time spent: {ins_elapsed / 60:.2f} minutes.")
-
-    # --- Out-of-Sample Estimation ---
-    if analysis_type in ['OOS', 'ALL']:
-        oos_start_time = time.time()
-        print("\n" + "="*30 + "\nOut-of-Sample Estimation\n" + "="*30)
-
-        oos_results_accumulator = []
-        for year in range(oos_start, oos_end + 1):
-            print("\n" + "-"*15 + f"\nTest Year: {year}\n" + "-"*15)
-
-            test_start_date, test_end_date = pd.to_datetime(f'{year}-01-01'), pd.to_datetime(f'{year}-12-31')
-            val_end_date = test_start_date - MonthEnd(1)
-            train_end_date = val_end_date - DateOffset(years=val_window)
-
-            train_df = df[df['date'] <= train_end_date]
-            val_df = df[(df['date'] > train_end_date) & (df['date'] <= val_end_date)]
-            test_df = df[(df['date'] >= test_start_date) & (df['date'] <= test_end_date)]
+            # Calculate and save portfolio parameters for both sets
+            train_port_params_df = calculate_portfolio_parameters(train_params_df_last_12m, port_wts, num_factors)
+            test_port_params_df = calculate_portfolio_parameters(test_params_df, port_wts, num_factors)
             
-            train_loader = DataLoader(PanelDataset(train_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=True)
-            val_loader = DataLoader(PanelDataset(val_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=False)
-            test_loader = DataLoader(PanelDataset(test_df, charc_list, port, port_list), batch_size=config.batch_size, shuffle=False)
-            
-            print("- Tuning Hyperparameters")
-            tuning_results = []
-            keys, values = zip(*param_grid.items())
-            param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
-            for i, grid_params in enumerate(param_combinations):
-                current_params = {**grid_params, 'num_factors': num_factors, 'beta_hidden_layers': beta_hidden_layers}
-                val_loss = train_single_model(current_params, config, train_loader, val_loader, num_charcs, num_ports, device)
-                tuning_results.append({'params': grid_params, 'loss': val_loss})
-            best_grid_params = min(tuning_results, key=lambda x: x['loss'])['params']
-            print(f"- Best Tuned Params: {best_grid_params}")
-
-            final_model = Autoencoder(num_charcs, num_ports, num_factors, beta_hidden_layers).to(device)
-            optimizer = optim.Adam(final_model.parameters(), lr=best_grid_params['learning_rate'])
-            criterion = nn.MSELoss()
-            
-            training_data_loader = DataLoader(PanelDataset(pd.concat([train_df, val_df]), charc_list, port, port_list), batch_size=config.batch_size, shuffle=True)
-            
-            for epoch in tqdm(range(config.max_epochs), desc=f"- Final Training"):
-                final_model.train()
-                for Z, R, port_ret, _, _ in training_data_loader:
-                    Z, R, port_ret = Z.squeeze(0).to(device), R.squeeze(0).to(device), port_ret.squeeze(0).to(device)
-                    if Z.shape[0] < num_charcs: continue
-                    optimizer.zero_grad()
-                    fitted_returns = final_model(Z, port_ret)
-                    mse_loss = criterion(fitted_returns, R)
-                    l1_norm = sum(p.abs().sum() for p in final_model.parameters())
-                    loss = mse_loss + best_grid_params['l1_lambda'] * l1_norm
-                    loss.backward()
-                    optimizer.step()
-
-            print("- Extracting & Saving OOS Results")
-            # Extract for test set
-            test_params_df, test_factors_df, test_returns_df = extract_results(final_model, test_loader, device, num_factors)
-            
-            # Extract for training set
-            train_params_df, train_factors_df, _ = extract_results(final_model, training_data_loader, device, num_factors)
-
-            if not test_params_df.empty:
-                # Filter training parameters to only the last 12 months (validation period)
-                last_12m_start_date = val_end_date - DateOffset(years=1) + MonthBegin(1)
-                train_params_df_last_12m = train_params_df[train_params_df['date'] >= last_12m_start_date]
-
-                # Calculate and save portfolio parameters for both sets
-                train_port_params_df = calculate_portfolio_parameters(train_params_df_last_12m, port_wts, num_factors)
-                test_port_params_df = calculate_portfolio_parameters(test_params_df, port_wts, num_factors)
-                
-                with pd.HDFStore(config.output_path, 'a') as store:
-                    store.put(f'OOS/F{num_factors}/{year}/train_factors', train_factors_df, format='table', data_columns=True)
-                    store.put(f'OOS/F{num_factors}/{year}/train_individual_params', train_params_df_last_12m, format='table', data_columns=True)
-                    store.put(f'OOS/F{num_factors}/{year}/train_port_params', train_port_params_df, format='table', data_columns=True)
-                    
-                    store.put(f'OOS/F{num_factors}/{year}/test_factors', test_factors_df, format='table', data_columns=True)
-                    store.put(f'OOS/F{num_factors}/{year}/test_individual_params', test_params_df, format='table', data_columns=True)
-                    store.put(f'OOS/F{num_factors}/{year}/test_port_params', test_port_params_df, format='table', data_columns=True)
-
-                # Accumulate results for final R2 calculation
-                test_returns_df = pd.merge(test_returns_df, test_params_df, on=['date', 'permno'])
-                test_returns_df = pd.merge(test_returns_df, test_factors_df, left_on='date', right_index=True)
-                
-                beta_cols = [f'beta_{i+1}' for i in range(num_factors)]
-                factor_cols = [f'factor_{i+1}' for i in range(num_factors)]
-                test_returns_df['risk_premium'] = (test_returns_df[beta_cols].values * test_returns_df[factor_cols].values).sum(axis=1)
-                test_returns_df['fitted_ret'] = test_returns_df['alpha'] + test_returns_df['risk_premium']
-                
-                # Use simple mean of the training sample factors for lambda
-                lambda_values = train_factors_df.mean()
-                lambda_cols = [f'lambda_{i+1}' for i in range(num_factors)]
-                for i, col in enumerate(lambda_cols):
-                    test_returns_df[col] = lambda_values[i]
-                
-                test_returns_df['pred_risk_premium'] = (test_returns_df[beta_cols].values * test_returns_df[lambda_cols].values).sum(axis=1)
-                test_returns_df['pred_ret'] = test_returns_df['alpha'] + test_returns_df['pred_risk_premium']
-                
-                oos_results_accumulator.append(test_returns_df)
-
-        # --- Final OOS R2 Calculation ---
-        if oos_results_accumulator:
-            full_oos_returns_df = pd.concat(oos_results_accumulator, ignore_index=True)
-            
-            oos_r2_df = calculate_comprehensive_r2(full_oos_returns_df, port_wts, port_list)
-            print("\n- OOS R2s")
-            print(oos_r2_df)
             with pd.HDFStore(config.output_path, 'a') as store:
-                store.put(f'OOS/F{num_factors}/r2', oos_r2_df, format='table', data_columns=True)
+                store.put(f'OOS/F{num_factors}/{year}/train_factors', train_factors_df, format='table', data_columns=True)
+                store.put(f'OOS/F{num_factors}/{year}/train_individual_params', train_params_df_last_12m, format='table', data_columns=True)
+                store.put(f'OOS/F{num_factors}/{year}/train_port_params', train_port_params_df, format='table', data_columns=True)
+                
+                store.put(f'OOS/F{num_factors}/{year}/test_factors', test_factors_df, format='table', data_columns=True)
+                store.put(f'OOS/F{num_factors}/{year}/test_individual_params', test_params_df, format='table', data_columns=True)
+                store.put(f'OOS/F{num_factors}/{year}/test_port_params', test_port_params_df, format='table', data_columns=True)
+
+            # Accumulate results for final R2 calculation
+            test_returns_df = pd.merge(test_returns_df, test_params_df, on=['date', 'permno'])
+            test_returns_df = pd.merge(test_returns_df, test_factors_df, left_on='date', right_index=True)
+            
+            beta_cols = [f'beta_{i+1}' for i in range(num_factors)]
+            factor_cols = [f'factor_{i+1}' for i in range(num_factors)]
+            test_returns_df['risk_premium'] = (test_returns_df[beta_cols].values * test_returns_df[factor_cols].values).sum(axis=1)
+            test_returns_df['fitted_ret'] = test_returns_df['alpha'] + test_returns_df['risk_premium']
+            
+            # Use simple mean of the training sample factors for lambda
+            lambda_values = train_factors_df.mean()
+            lambda_cols = [f'lambda_{i+1}' for i in range(num_factors)]
+            for i, col in enumerate(lambda_cols):
+                test_returns_df[col] = lambda_values[i]
+            
+            test_returns_df['pred_risk_premium'] = (test_returns_df[beta_cols].values * test_returns_df[lambda_cols].values).sum(axis=1)
+            test_returns_df['pred_ret'] = test_returns_df['alpha'] + test_returns_df['pred_risk_premium']
+            
+            oos_results_accumulator.append(test_returns_df)
         
-        oos_elapsed = time.time() - oos_start_time
-        print(f"Out-of-sample analysis finished. Time spent: {oos_elapsed / 60:.2f} minutes.")
+        # --- Memory Management ---
+        # Clean up memory after each year to prevent kernel from dying
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # --- Final OOS R2 Calculation ---
+    if oos_results_accumulator:
+        full_oos_returns_df = pd.concat(oos_results_accumulator, ignore_index=True)
+        
+        oos_r2_df = calculate_comprehensive_r2(full_oos_returns_df, port_wts, port_list)
+        print("\n- OOS R2s")
+        print(oos_r2_df)
+        with pd.HDFStore(config.output_path, 'a') as store:
+            store.put(f'OOS/F{num_factors}/r2', oos_r2_df, format='table', data_columns=True)
+    
+    oos_elapsed = time.time() - oos_start_time
+    print(f"Out-of-sample analysis finished. Time spent: {oos_elapsed / 60:.2f} minutes.")
 
 
 def load_data(data_path):
@@ -461,8 +465,8 @@ def load_data(data_path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run Autoencoder Asset Pricing Models.')
-    parser.add_argument('--model', type=str, default='AE2', choices=['AE1', 'AE2', 'AE3'], help='Specify the model architecture (AE1, AE2, or AE3).')
-    parser.add_argument('--analysis_type', type=str, default='ALL', choices=['ALL', 'INS', 'OOS'], help='Specify which analysis to run.')
+    parser.add_argument('--model', type=str, default='AE2', choices=['AE1', 'AE2', 'AE3', 'AE4', 'AE5'], help='Specify the model architecture (AE1, AE2, AE3, AE4, or AE5).')
+    parser.add_argument('--num_factors', type=int, default=5, help='Specify the number of latent factors.')
     args = parser.parse_args()
 
     total_start_time = time.time()
@@ -493,7 +497,9 @@ if __name__ == '__main__':
     model_archs = {
         'AE1': [32],
         'AE2': [32, 16],
-        'AE3': [32, 16, 8]
+        'AE3': [32, 16, 8],
+        'AE4': [32, 16, 8, 4],
+        'AE5': [32, 16, 8, 4, 2]
     }
     beta_hidden_layers = model_archs[args.model]
     
@@ -503,22 +509,21 @@ if __name__ == '__main__':
     val_window = 12 
     
     config = Config()
-    config.output_path = f'model_est_{args.model}.h5'
+    config.output_path = f'/work/rw196/output/model_est_{args.model}.h5'
     
-    # Run models
-    for num_factors in [1, 3, 5, 6]:
-        print(f"\nEstimating {args.model} -> {beta_hidden_layers} hidden layers, {num_factors} factors.")
-        run_model(
-            data=data,
-            param_grid=param_grid,
-            config=config,
-            oos_start=oos_start,
-            oos_end=oos_end,
-            val_window=val_window,
-            num_factors=num_factors,
-            beta_hidden_layers=beta_hidden_layers,
-            analysis_type=args.analysis_type
-        )
+    # Run model
+    print(f"\nEstimating {args.model} -> {beta_hidden_layers} hidden layers, {args.num_factors} factors.")
+    run_model(
+        data=data,
+        param_grid=param_grid,
+        config=config,
+        oos_start=oos_start,
+        oos_end=oos_end,
+        val_window=val_window,
+        num_factors=args.num_factors,
+        beta_hidden_layers=beta_hidden_layers
+    )
     
     elapsed = time.time() - total_start_time
     print(f"\nTotal execution time: {elapsed / 60:.2f} minutes.")
+
