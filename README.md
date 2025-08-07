@@ -1,6 +1,6 @@
 ## Autoencoder Asset Pricing Models
 
-This repository implements the conditional autoencoder asset pricing models from [Gu, Kelly, and Xiu (2021)](https://www.sciencedirect.com/science/article/pii/S0304407620301998), "Autoencoder asset pricing models," Journal of Econometrics. The script is designed to perform both an in-sample estimation and a rolling out-of-sample estimation. It leverages PyTorch for GPU acceleration and includes a hyperparameter tuning pipeline to optimize model performance.
+This repository implements the conditional autoencoder asset pricing models from [Gu, Kelly, and Xiu (2021)](https://www.sciencedirect.com/science/article/pii/S0304407620301998), _"Autoencoder asset pricing models," Journal of Econometrics_. The script is designed to perform both an in-sample estimation and a rolling out-of-sample estimation. It leverages PyTorch for GPU acceleration and includes a hyperparameter tuning pipeline to optimize model performance.
 
 ### Environment Setup
 
