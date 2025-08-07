@@ -30,7 +30,7 @@ Data were constructed and preprocessed in a separate repo: [Prepare-Data-for-Ass
 
 ### Execution
 
-The script is run from the terminal and can be configured with command-line arguments. Use the "--model" flag to choose between the predefined architectures (AE1, AE2, AE3, AE4 or AE5). Use the "--num_factors" flag to choose the number of factors
+The script is run from the terminal and can be configured with command-line arguments. Use the "--model" flag to choose between the predefined architectures (AE1, AE2, AE3, AE4 or AE5). Use the "--num_factors" flag to choose the number of factors. 
 
 ```bash
 python3 model_AE.py --model AE2 --num_factors 5
