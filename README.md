@@ -30,7 +30,7 @@ Data were constructed and preprocessed in a separate repository: [Prepare-Data-f
 
 ### Execution
 
-The script `_model_AE.py` is designed to be executed from the terminal and supports configuration via command-line arguments. Use the `--model` flag to specify one of the predefined architectures: `AE1`, `AE2`, `AE3`, `AE4`, or `AE5`. The `--num_factors` flag allows you to set the desired number of latent factors.
+The script `_model_AE.py` is designed to be executed from the terminal and supports configuration via command-line arguments. Use the `--model` flag to specify one of the predefined architectures: `AE1`, `AE2`, `AE3`, `AE4`, or `AE5`. Use the `--num_factors` flag  to set the desired numbers of latent factors.
 
 ```bash
 python3 model_AE.py --model AE2 --num_factors 1 3 5 6
