@@ -466,7 +466,7 @@ def load_data(data_path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run Autoencoder Asset Pricing Models.')
     parser.add_argument('--model', type=str, default='AE2', choices=['AE1', 'AE2', 'AE3', 'AE4', 'AE5'], help='Specify the model architecture (AE1, AE2, AE3, AE4, or AE5).')
-    parser.add_argument('--num_factors', type=int, default=5, help='Specify the number of latent factors.')
+    parser.add_argument('--num_factors', type=int, nargs='*', default=[5], help='Specify one or more numbers of latent factors.')
     args = parser.parse_args()
 
     total_start_time = time.time()
@@ -512,18 +512,18 @@ if __name__ == '__main__':
     config.output_path = f'/work/rw196/output/model_est_{args.model}.h5'
     
     # Run model
-    print(f"\nEstimating {args.model} -> {beta_hidden_layers} hidden layers, {args.num_factors} factors.")
-    run_model(
-        data=data,
-        param_grid=param_grid,
-        config=config,
-        oos_start=oos_start,
-        oos_end=oos_end,
-        val_window=val_window,
-        num_factors=args.num_factors,
-        beta_hidden_layers=beta_hidden_layers
-    )
+    for num_factor in args.num_factors:
+        print(f"\nEstimating {args.model} -> {beta_hidden_layers} hidden layers, {num_factor} factors.")
+        run_model(
+            data=data,
+            param_grid=param_grid,
+            config=config,
+            oos_start=oos_start,
+            oos_end=oos_end,
+            val_window=val_window,
+            num_factors=num_factor, 
+            beta_hidden_layers=beta_hidden_layers
+        )
     
     elapsed = time.time() - total_start_time
     print(f"\nTotal execution time: {elapsed / 60:.2f} minutes.")
-
