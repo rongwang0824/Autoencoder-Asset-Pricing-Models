@@ -503,7 +503,7 @@ if __name__ == '__main__':
     }
     beta_hidden_layers = model_archs[args.model]
     
-    param_grid = {'learning_rate': [1e-3, 1e-4], 'l1_lambda': [1e-4, 1e-5]}
+    param_grid = {'learning_rate': [0.005, 0.001, 0.0005, 1e-4, 1e-5], 'l1_lambda': [1e-4, 1e-5]}
     oos_start = 1990
     oos_end = 2024
     val_window = 12 
