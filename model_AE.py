@@ -373,6 +373,14 @@ def run_model(data, param_grid, config, oos_start, oos_end, val_window, num_fact
                 optimizer.step()
 
         print("- Extracting & Saving OOS Results")
+        # Extract the factor weights on portfolios from the trained model
+        factor_weights = final_model.factor_net.weight.cpu().detach().numpy()
+        factor_weights_df = pd.DataFrame(
+            factor_weights,
+            columns=port_list,
+            index=[f'factor_{i+1}' for i in range(num_factors)]
+        )
+        
         # Extract for test set
         test_params_df, test_factors_df, test_returns_df = extract_results(final_model, test_loader, device, num_factors)
         
@@ -389,6 +397,7 @@ def run_model(data, param_grid, config, oos_start, oos_end, val_window, num_fact
             test_port_params_df = calculate_portfolio_parameters(test_params_df, port_wts, num_factors)
             
             with pd.HDFStore(config.output_path, 'a') as store:
+                store.put(f'OOS/F{num_factors}/{year}/factor_weights', factor_weights_df.T, format='table', data_columns=True)
                 store.put(f'OOS/F{num_factors}/{year}/train_factors', train_factors_df, format='table', data_columns=True)
                 store.put(f'OOS/F{num_factors}/{year}/train_individual_params', train_params_df_last_12m, format='table', data_columns=True)
                 store.put(f'OOS/F{num_factors}/{year}/train_port_params', train_port_params_df, format='table', data_columns=True)
@@ -503,7 +512,7 @@ if __name__ == '__main__':
     }
     beta_hidden_layers = model_archs[args.model]
     
-    param_grid = {'learning_rate': [0.005, 0.001, 0.0005, 1e-4, 1e-5], 'l1_lambda': [1e-4, 1e-5]}
+    param_grid = {'learning_rate': [0.005, 0.001, 0.0005, 0.0001, 1e-5], 'l1_lambda': [0.005, 0.001, 0.0005, 0.0001, 1e-5]}
     oos_start = 1990
     oos_end = 2024
     val_window = 12 
