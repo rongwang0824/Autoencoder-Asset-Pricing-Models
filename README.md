@@ -9,7 +9,8 @@ The analysis is managed within a Conda environment to ensure reproducibility. I 
 ```bash
 conda create --name EAPenv python=3.9 -y
 conda activate EAPenv 
-conda install -c pytorch -c nvidia -c conda-forge pytorch torchvision torchaudio pytorch-cuda=12.1 pandas numpy tqdm scikit-learn statsmodels joblib seaborn matplotlib openpyxl pyarrow pytables ipykernel -y
+conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=12.1 -y
+conda install -c conda-forge pandas numpy tqdm scikit-learn statsmodels joblib seaborn matplotlib openpyxl pyarrow pytables ipykernel -y
 python -m ipykernel install --user --name EAPenv --display-name "EAPenv"
 conda env export > EAPenvironment.yml
 ```
