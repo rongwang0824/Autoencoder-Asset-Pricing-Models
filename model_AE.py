@@ -467,6 +467,26 @@ def load_data(data_path):
     port_wts['date'] = pd.to_datetime(port_wts['date'], format='%Y%m')
     port_wts.fillna(0, inplace=True) # Fill NaN with 0
 
+    # Standardize data types for PyTorch
+    def prep_for_pytorch(dataframe):
+        """Converts Pandas extension types and Float64s to standard np.float32/np.int64"""
+        # 1. Grab all float columns (including Pandas Float32/Float64 extension types)
+        float_cols = dataframe.select_dtypes(include=['float', 'Float32', 'Float64']).columns
+        # Cast to pure NumPy 32-bit floats
+        dataframe[float_cols] = dataframe[float_cols].astype(np.float32)
+        
+        # 2. Grab all integer columns (including Pandas Int32/Int64 extension types)
+        int_cols = dataframe.select_dtypes(include=['int', 'Int32', 'Int64']).columns
+        # Cast to pure NumPy 64-bit integers
+        dataframe[int_cols] = dataframe[int_cols].astype(np.int64)
+        
+        return dataframe
+
+    df = prep_for_pytorch(df)
+    port = prep_for_pytorch(port)
+    port_wts = prep_for_pytorch(port_wts)
+
+    # Save to a data structure
     data = {'df': df, 'charc_list': charc_list, 'port': port, 'port_list': port_list, 'port_wts': port_wts}
     print(f"Data loaded. Time spent: {time.time() - start_time:.2f} seconds.")
     return data
@@ -481,7 +501,7 @@ if __name__ == '__main__':
     total_start_time = time.time()
 
     # --- Caching Logic ---
-    data_path = '/work/rw196/data/ALL'
+    data_path = '/work/rw196/data'
     cache_path = os.path.join(data_path, 'data_cache.pkl')
 
     if os.path.exists(cache_path):
@@ -514,7 +534,7 @@ if __name__ == '__main__':
     
     param_grid = {'learning_rate': [0.005, 0.001, 0.0005, 0.0001, 1e-5], 'l1_lambda': [0.005, 0.001, 0.0005, 0.0001, 1e-5]}
     oos_start = 1990
-    oos_end = 2024
+    oos_end = 2025
     val_window = 12 
     
     config = Config()
